@@ -28,6 +28,7 @@ from src.utils import (
 )
 from DCUDF.dcudf.mesh_extraction import Dcudf_on_UDF
 from DCUDF.udf_models import Weighted_Dist_UDF
+from joblib import Parallel, delayed
 
 # set visible GPU
 # os.environ["CUDA_VISIBLE_DEVICES"] = "6,7"
@@ -75,8 +76,35 @@ def query_function(input_pcd, query_points, device):
     return udf_model.forward(input_pcd, query_points)
 
 
+def process_single_patch(i, filtered_query_idx, filtered_indices, coords, verts):
+    query_idx = filtered_query_idx[i]
+    idx = filtered_indices[i]
+    query_0 = coords[query_idx]
+    verts_sel = verts[idx]
+    # normalize to a sphere with radius 1
+    verts_query = np.vstack([query_0, verts_sel])
+    translation = np.mean(verts_query, axis=0)
+    verts_query -= translation
+    max_dist = np.max(np.linalg.norm(verts_query, axis=1))
+    scale_factor = 1.0 / max_dist
+    verts_query = verts_query * scale_factor
+    query = verts_query[0]
+    verts_sel = verts_query[1:]
+    if len(idx) == 128:
+        verts_sel = verts_sel
+    elif len(idx) > 128:
+        ratio = 128 / len(idx)
+        sel_idx = fps(torch.tensor(verts_sel), ratio=ratio)
+        verts_sel = verts_sel[sel_idx]
+    else:
+        mean_v = np.mean(verts_sel, axis=0)
+        padding_length = 128 - len(idx)
+        verts_sel = np.vstack([verts_sel, np.tile(mean_v, (padding_length, 1))])
+    return verts_sel, query, scale_factor
+
+
 def local_patch_extract(
-    pcd_dir, pcd_path, radius, has_noise, noise_level, has_outliers, outlier_ratio
+        pcd_dir, pcd_path, radius, has_noise, noise_level, has_outliers, outlier_ratio
 ):
     print("Extracting local patches...")
     pcd_name = pcd_path.split("/")[-1].split(".")[0]
@@ -125,64 +153,24 @@ def local_patch_extract(
     pts_in_lengths = np.array(pts_in_lengths)
     filtered_query_idx = np.where(pts_in_lengths > 5)[0]
     filtered_indices = indices[filtered_query_idx]
+
+    # multi-threading to process patches
+    results = Parallel(n_jobs=os.cpu_count() - 2)(
+        delayed(process_single_patch)(i, filtered_query_idx, filtered_indices, coords, verts) for i in
+        range(len(filtered_indices)))
     PatchVerts = np.zeros((len(filtered_indices), 128, 3))
     Queries = np.zeros((len(filtered_indices), 3))
-    Queries_0 = np.zeros((len(filtered_indices), 3))
     ScaleFactors = np.zeros(len(filtered_indices))
-    for i in tqdm(range(len(filtered_indices))):
-        query_idx = filtered_query_idx[i]
-        idx = filtered_indices[i]
-        query_0 = coords[query_idx]
-        verts_sel = verts[idx]
-        # normalize to a sphere with radius 1
-        verts_query = np.vstack([query_0, verts_sel])
-        translation = np.mean(verts_query, axis=0)
-        verts_query -= translation
-        max_dist = np.max(np.linalg.norm(verts_query, axis=1))
-        scale_factor = 1.0 / max_dist
-        verts_query = verts_query * scale_factor
-        query = verts_query[0]
-        verts_sel = verts_query[1:]
-        if len(idx) == 128:
-            verts_sel = verts_sel
-        elif len(idx) > 128:
-            ratio = 128 / len(idx)
-            sel_idx = fps(torch.tensor(verts_sel), ratio=ratio)
-            # sel_idx = np.random.choice(len(idx), 128, replace=False)
-            verts_sel = verts_sel[sel_idx]
-        else:
-            mean_v = np.mean(verts_sel, axis=0)
-            padding_length = 128 - len(idx)
-            verts_sel = np.vstack([verts_sel, np.tile(mean_v, (padding_length, 1))])
-            # # upsample by fitting
-            # x, y, z = verts_sel[:, 0], verts_sel[:, 1], verts_sel[:, 2]
-            # A = 0.5 * np.vstack((x**2, y**2)).T
-            # k_opt, _, _, _ = np.linalg.lstsq(A, z, rcond=None)
-            # k1, k2 = k_opt
-            # # randomly generate 256 points [x,y] in unit disk
-            # r = np.sqrt(np.random.rand(256))
-            # theta = np.random.rand(256) * 2 * np.pi
-            # x = r * np.cos(theta)
-            # y = r * np.sin(theta)
-            # z = 0.5 * (k1 * x**2 + k2 * y**2)
-            # ratio = 128 / 256
-            # sel_idx = fps(torch.tensor(np.vstack([x, y, z]).T), ratio=ratio)
-            # verts_sel = np.vstack([x, y, z]).T[sel_idx]
+    for i, (verts_sel, query, scale_factor) in enumerate(results):
         PatchVerts[i] = verts_sel
         Queries[i] = query
-        Queries_0[i] = query_0
         ScaleFactors[i] = scale_factor
-    patch = {}
-    patch["PatchVerts"] = PatchVerts.astype(np.float32)
-    patch["Queries"] = Queries.astype(np.float32)
-    # patch["Queries_0"] = Queries_0
-    patch["ScaleFactors"] = ScaleFactors.astype(np.float32)
-    patch["Queries_IDX"] = filtered_query_idx
+    patch = {"PatchVerts": PatchVerts.astype(np.float32), "Queries": Queries.astype(np.float32),
+             "ScaleFactors": ScaleFactors.astype(np.float32), "Queries_IDX": filtered_query_idx}
     return patch
 
 
 def evaluate(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-
     assert cfg.ckpt_path
 
     log.info(f"Instantiating model <{cfg.model._target_}>")
@@ -232,7 +220,7 @@ def evaluate(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         if file.endswith(".ply"):
             pc_path_list.append(file)
     for i in range(len(pc_path_list)):
-        print(f"Processing {i+1}/{len(pc_path_list)}>>>\n")
+        print(f"Processing {i + 1}/{len(pc_path_list)}>>>\n")
         pc_path = os.path.join(pc_dir, pc_path_list[i])
         data_name = pc_path.split("/")[-1].split(".pl")[0]
         # data_name = data_name.split("/")[-1]
