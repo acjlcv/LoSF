@@ -5,7 +5,6 @@ from torchmetrics import MinMetric, MeanMetric
 import numpy as np
 from typing import Any
 
-
 class Local2UDFModule(LightningModule):
     def __init__(
         self,
@@ -51,7 +50,7 @@ class Local2UDFModule(LightningModule):
         pred_udf, displacement = self.net(
             pts_feature, vecs_feature, pts_denoise_feature, distance
         )
-        
+
         return pred_udf, displacement
 
     def on_train_start(self):

@@ -18,8 +18,8 @@ from time import time
 
 rootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
 
-from src.utils import get_grid_coords
-from src.utils import (
+from src.utils.utils import get_grid_coords
+from src.utils.utils import (
     RankedLogger,
     extras,
     instantiate_loggers,
@@ -165,8 +165,10 @@ def local_patch_extract(
         PatchVerts[i] = verts_sel
         Queries[i] = query
         ScaleFactors[i] = scale_factor
+
     patch = {"PatchVerts": PatchVerts.astype(np.float32), "Queries": Queries.astype(np.float32),
              "ScaleFactors": ScaleFactors.astype(np.float32), "Queries_IDX": filtered_query_idx}
+
     return patch
 
 
